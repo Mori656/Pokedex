@@ -1,0 +1,4 @@
+/PokemonData
+*.pt
+split_indices.json
+__pycache__/
