@@ -13,6 +13,10 @@ Skrypt realizuje wymagania projektu (Etapy 1-4 oraz Wymagane rezultaty z pkt 5):
 6. Ewaluacja na zbiorze testowym: Top-1 Accuracy, Top-5 Accuracy, Macro F1.
 7. Automatyczne generowanie wykresów uczenia (wykresy_treningu.png).
 
+Trening domyślnie wymaga karty NVIDIA (CUDA) i działa w trybie bezpiecznym
+(limit VRAM, limit obciążenia, nadzór temperatury) - szczegóły w gpu_guard.py
+oraz w Instrukcja_Testow_i_Treningu.md.
+
 Tryby uruchomienia:
     # 1. Szybki test samej architektury (Sanity Check: kształt tensora, brak NaN, parametry):
     python train_pokemon.py --sanity-check
@@ -46,6 +50,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import f1_score, classification_report
+
+from gpu_guard import GPUGuard, GPUSafetyError, NO_CUDA_MESSAGE, add_gpu_safety_args, config_from_args
 
 
 # ==============================================================================
@@ -141,13 +147,15 @@ class ResNet18Pokemon(nn.Module):
         return x
 
 
-def run_sanity_check():
+def run_sanity_check(device=None):
     """Weryfikacja modelu przed treningiem (Etap 2 wytycznych)."""
     print("=" * 70)
     print("ETAP 2: SANITY CHECK MODELU (SPRAWDZENIE ARCHITEKTURY)")
     print("=" * 70)
 
-    model = ResNet18Pokemon(num_classes=149, dropout_p=0.3)
+    device = device or torch.device("cpu")
+    print(f"Urządzenie: {device}")
+    model = ResNet18Pokemon(num_classes=149, dropout_p=0.3).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -157,7 +165,7 @@ def run_sanity_check():
 
     # Testowy przebieg w przód (Forward Pass)
     batch_size = 32
-    dummy_input = torch.randn(batch_size, 3, 224, 224)
+    dummy_input = torch.randn(batch_size, 3, 224, 224, device=device)
     print(f"\nGenerowanie testowego tensora wejściowego: {list(dummy_input.shape)}")
 
     model.eval()
@@ -172,7 +180,7 @@ def run_sanity_check():
 
     # Test funkcji straty CrossEntropyLoss
     criterion = nn.CrossEntropyLoss()
-    dummy_targets = torch.randint(0, 149, (batch_size,))
+    dummy_targets = torch.randint(0, 149, (batch_size,), device=device)
     loss = criterion(output, dummy_targets)
     print(f"Testowa wartość CrossEntropyLoss:          {loss.item():.4f}")
     assert not torch.isnan(loss), "BŁĄD: Strata ma wartość NaN!"
@@ -317,7 +325,7 @@ def scan_and_split_dataset(data_dir, split_save_path="split_indices.json", seed=
 # 4. METRYKI, PĘTLA TRENINGOWA I EWALUACJA
 # ==============================================================================
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_amp=False, guard=None):
     model.eval()
     running_loss = 0.0
     all_targets = []
@@ -328,8 +336,13 @@ def evaluate(model, loader, criterion, device):
 
     with torch.no_grad():
         for inputs, targets in loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
+            if guard:
+                guard.step_begin()
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                outputs = model(inputs)
+            outputs = outputs.float()
             loss = criterion(outputs, targets)
 
             running_loss += loss.item() * inputs.size(0)
@@ -346,6 +359,9 @@ def evaluate(model, loader, criterion, device):
             all_targets.extend(targets.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
 
+            if guard:
+                guard.step_end()
+
     avg_loss = running_loss / max(1, total_samples)
     top1_acc = (correct_top1 / max(1, total_samples)) * 100.0
     top5_acc = (correct_top5 / max(1, total_samples)) * 100.0
@@ -354,10 +370,11 @@ def evaluate(model, loader, criterion, device):
     return avg_loss, top1_acc, top5_acc, macro_f1, all_targets, all_preds
 
 
-def train_model(data_dir, epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
+def train_model(data_dir, device, guard=None, use_amp=True, num_workers=None,
+                epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
                 smoke_test=False, checkpoint_path="best_model.pt"):
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-    print(f"\nUżywane urządzenie obliczeniowe: {device}")
+    use_amp = use_amp and device.type == 'cuda'
+    print(f"\nUżywane urządzenie obliczeniowe: {device} | Mieszana precyzja (AMP): {'tak' if use_amp else 'nie'}")
 
     # 1. Wczytanie i podział danych
     train_data, val_data, test_data, class_names = scan_and_split_dataset(data_dir)
@@ -391,16 +408,20 @@ def train_model(data_dir, epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
     val_dataset = PokemonDataset(val_paths, val_labels, transform=eval_transform)
     test_dataset = PokemonDataset(test_paths, test_labels, transform=eval_transform)
 
-    num_workers = 2 if os.name != 'nt' and not smoke_test else 0
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    if num_workers is None:
+        num_workers = 2 if os.name != 'nt' and not smoke_test else 0
+    pin_memory = device.type == 'cuda'
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
 
     # 3. Model, strata, optymalizator i scheduler
     model = ResNet18Pokemon(num_classes=len(class_names), dropout_p=0.3).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': [], 'val_f1': [], 'lr': []}
     best_val_loss = float('inf')
@@ -420,18 +441,27 @@ def train_model(data_dir, epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
         train_total = 0
 
         for step, (inputs, targets) in enumerate(train_loader, 1):
-            inputs, targets = inputs.to(device), targets.to(device)
+            if guard:
+                guard.step_begin()
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                outputs = model(inputs)
+            outputs = outputs.float()
             loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item() * inputs.size(0)
             preds = torch.argmax(outputs, dim=1)
             train_correct += (preds == targets).sum().item()
             train_total += targets.size(0)
+
+            if guard:
+                guard.step_end()
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -439,7 +469,7 @@ def train_model(data_dir, epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
         epoch_train_loss = train_loss / max(1, train_total)
         epoch_train_acc = (train_correct / max(1, train_total)) * 100.0
 
-        val_loss, val_top1, val_top5, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
+        val_loss, val_top1, val_top5, val_f1, _, _ = evaluate(model, val_loader, criterion, device, use_amp, guard)
 
         history['train_loss'].append(epoch_train_loss)
         history['val_loss'].append(val_loss)
@@ -452,6 +482,10 @@ def train_model(data_dir, epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
               f"Train Loss: {epoch_train_loss:.4f}, Acc: {epoch_train_acc:.2f}% | "
               f"Val Loss: {val_loss:.4f}, Top-1: {val_top1:.2f}%, Top-5: {val_top5:.2f}%, Macro-F1: {val_f1:.4f} | "
               f"LR: {current_lr:.6f}")
+        if guard:
+            status = guard.status_line()
+            if status:
+                print(f"  {status}")
 
         # Zapis najlepszego modelu (Early Stopping / Checkpointing)
         if val_loss < best_val_loss:
@@ -487,7 +521,7 @@ def train_model(data_dir, epochs=25, batch_size=32, lr=3e-4, weight_decay=1e-4,
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
 
-    test_loss, test_top1, test_top5, test_f1, _, _ = evaluate(model, test_loader, criterion, device)
+    test_loss, test_top1, test_top5, test_f1, _, _ = evaluate(model, test_loader, criterion, device, use_amp, guard)
     print(f"Wyniki testowe (Test Set):")
     print(f"  • Test Loss:     {test_loss:.4f}")
     print(f"  • Top-1 Accuracy: {test_top1:.2f}%")
@@ -530,6 +564,35 @@ def plot_training_curves(history, save_path="wykresy_treningu.png"):
 # 5. PUNKT WEJŚCIA (CLI)
 # ==============================================================================
 
+def run(args, device, guard):
+    if args.sanity_check:
+        run_sanity_check(device)
+    elif args.eval_only:
+        print(f"Weryfikacja modelu na zbiorze testowym przy użyciu checkpointu: {args.checkpoint}")
+        # Tutaj wykonanie ewaluacji
+        run_sanity_check(device)
+    else:
+        if not os.path.exists(args.data_dir):
+            print(f"[OSTRZEŻENIE] Nie znaleziono katalogu {args.data_dir}.")
+            print("Wykonuję w zamian Sanity Check architektury ResNet-18:")
+            run_sanity_check(device)
+            print("\nAby uruchomić trening na rzeczywistych danych, upewnij się, że folder PokemonData istnieje,")
+            print("lub wskaż właściwą ścieżkę argumentem: --data-dir /sciezka/do/PokemonData")
+        else:
+            train_model(
+                data_dir=args.data_dir,
+                device=device,
+                guard=guard,
+                use_amp=not args.no_amp,
+                num_workers=args.num_workers,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                smoke_test=args.smoke_test,
+                checkpoint_path=args.checkpoint
+            )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Trening i testy modelu ResNet-18 dla Pokemonów")
     parser.add_argument('--sanity-check', action='store_true', help='Wykonaj tylko szybki test architektury i wymiarów tensorów')
@@ -541,28 +604,23 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=32, help='Rozmiar batcha')
     parser.add_argument('--lr', type=float, default=3e-4, help='Początkowy Learning Rate')
 
+    add_gpu_safety_args(parser)
     args = parser.parse_args()
 
-    if args.sanity_check:
-        run_sanity_check()
-    elif args.eval_only:
-        print(f"Weryfikacja modelu na zbiorze testowym przy użyciu checkpointu: {args.checkpoint}")
-        # Tutaj wykonanie ewaluacji
-        run_sanity_check()
-    else:
-        # Domyślnie trening lub smoke-test
-        if not os.path.exists(args.data_dir):
-            print(f"[OSTRZEŻENIE] Nie znaleziono katalogu {args.data_dir}.")
-            print("Wykonuję w zamian Sanity Check architektury ResNet-18:")
-            run_sanity_check()
-            print("\nAby uruchomić trening na rzeczywistych danych, upewnij się, że folder PokemonData istnieje,")
-            print("lub wskaż właściwą ścieżkę argumentem: --data-dir /sciezka/do/PokemonData")
+    try:
+        if torch.cuda.is_available():
+            guard_ctx = GPUGuard(config_from_args(args))
+        elif args.allow_cpu:
+            print("[OSTRZEŻENIE] CUDA niedostępne - trening na CPU (użyto --allow-cpu).")
+            guard_ctx = None
         else:
-            train_model(
-                data_dir=args.data_dir,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
-                smoke_test=args.smoke_test,
-                checkpoint_path=args.checkpoint
-            )
+            raise GPUSafetyError(NO_CUDA_MESSAGE)
+
+        if guard_ctx is not None:
+            with guard_ctx as guard:
+                run(args, guard.device, guard)
+        else:
+            run(args, torch.device("cpu"), None)
+    except GPUSafetyError as e:
+        print(f"\n[GPU-GUARD] {e}")
+        sys.exit(2)
