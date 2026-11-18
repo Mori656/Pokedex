@@ -2,7 +2,7 @@
 Projekt: Klasyfikacja Pokemonów I generacji (149 klas)
 Model: ResNet-18 trenowany od podstaw (From Scratch)
 Przedmiot: Sieci neuronowe i uczenie głębokie – Akademia Tarnowska (2026)
-Autor: Marcel Nosek
+Autor: Marcel Nosek i Konrad Jasiński
 
 Skrypt realizuje wymagania projektu (Etapy 1-4 oraz Wymagane rezultaty z pkt 5):
 1. Podział Train / Val / Test (70% / 15% / 15%) ze stratyfikacją i deduplikacją SHA-256.
